@@ -1,0 +1,17 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: code-byte
+  namespace: monitoring
+  labels:
+    release: prometheus-stack
+spec:
+  selector:
+    matchLabels:
+      app: code-byte
+  namespaceSelector:
+    matchNames:
+      - code-byte-ns
+  endpoints:
+  - port: metrics
+    path: /metrics

@@ -1,0 +1,20 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: code-byte-argocd
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: 'https://github.com/hunjanhar/code-byte.git'
+    targetRevision: prod                                 
+    path: k8s/prod-deployment                                    
+  destination:
+    server: 'https://kubernetes.default.svc'
+    namespace: code-byte-ns
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

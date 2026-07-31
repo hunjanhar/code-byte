@@ -1,0 +1,12 @@
+.env
+.env.jenkins
+.env.example
+docker-compose.yml
+.DS_Store
+argo-deployment
+k8s-deployment
+email-config
+terraform
+remote-infa
+.env.configure.jenkins
+scripts

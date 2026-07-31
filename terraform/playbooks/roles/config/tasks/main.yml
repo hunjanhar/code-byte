@@ -1,0 +1,395 @@
+- name: Nuke any old broken legacy Jenkins repository files from host
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/apt/sources.list.d/jenkins.list
+    - /etc/apt/sources.list.d/jenkins.sources
+
+- name: Clear stubborn background apt locks if they exist
+  shell: |
+    killall apt apt-get unattended-upgrades || true
+    rm -f /var/lib/apt/lists/lock
+    rm -f /var/lib/dpkg/lock
+    rm -f /var/lib/dpkg/lock-frontend
+    dpkg --configure -a
+  failed_when: false
+
+- name: Update apt packages cleanly (Non-Interactive)
+  apt:
+    update_cache: yes
+    upgrade: dist
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+
+- name: Install fundamental utilities (Git, PHP, and Runtime Essentials)
+  apt:
+    name:
+      - curl
+      - wget
+      - git
+      - unzip
+      - docker.io
+      - mysql-client
+      - php-cli
+      - php-fpm
+      - php-mbstring
+      - php-xml
+      - openjdk-21-jre-headless
+    state: present
+
+- name: Install dependencies for Trivy and Jenkins repositories
+  apt:
+    name:
+      - gpg
+      - apt-transport-https
+      - ca-certificates
+    state: present
+
+- name: Ensure modern APT keyrings directory exists
+  file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: '0755'
+
+- name: Download Trivy GPG key securely
+  get_url:
+    url: https://aquasecurity.github.io/trivy-repo/deb/public.key
+    dest: /etc/apt/keyrings/trivy.asc
+    mode: '0644'
+
+- name: Add Trivy Debian repository referencing the key ring
+  apt_repository:
+    repo: "deb [signed-by=/etc/apt/keyrings/trivy.asc] https://aquasecurity.github.io/trivy-repo/deb {{ ansible_distribution_release }} main"
+    state: present
+    filename: trivy
+
+- name: Install Trivy Security Scanner via Apt
+  apt:
+    name: trivy
+    state: present
+    update_cache: yes
+
+- name: Download Gitleaks Security Tool Binary
+  get_url:
+    url: "https://github.com/gitleaks/gitleaks/releases/download/v8.18.2/gitleaks_8.18.2_linux_x64.tar.gz"
+    dest: "/tmp/gitleaks.tar.gz"
+    mode: '0644'
+
+- name: Unarchive and Install Gitleaks Globally
+  unarchive:
+    src: "/tmp/gitleaks.tar.gz"
+    dest: "/usr/local/bin/"
+    remote_src: yes
+    mode: '0755'
+  args:
+    creates: /usr/local/bin/gitleaks
+
+- name: Download OWASP ZAP CLI Core Archive from Archive Registry
+  ansible.builtin.get_url:
+    url: "https://github.com/zaproxy/zap-archive/releases/download/zap-v2.15.0/ZAP_2.15.0_Linux.tar.gz"
+    dest: "/tmp/zaproxy.tar.gz"
+    mode: '0644'
+
+- name: Ensure /opt/zaproxy directory structure exists
+  ansible.builtin.file:
+    path: /opt/zaproxy
+    state: directory
+    mode: '0755'
+
+- name: Extract OWASP ZAP CLI utility
+  ansible.builtin.unarchive:
+    src: "/tmp/zaproxy.tar.gz"
+    dest: "/opt/zaproxy/"
+    remote_src: yes
+  args:
+    creates: /opt/zaproxy/ZAP_2.15.0/zap.sh
+
+- name: Create global symlink for OWASP ZAP execution
+  ansible.builtin.file:
+    src: /opt/zaproxy/ZAP_2.15.0/zap.sh
+    dest: "/usr/local/bin/zap"
+    state: link
+
+- name: Enable and start Docker service
+  service:
+    name: docker
+    state: started
+    enabled: yes
+
+- name: Add user to docker group
+  user:
+    name: "{{ ansible_user }}"
+    groups: docker
+    append: yes
+
+- name: Reset SSH connection to apply docker group changes
+  meta: reset_connection
+
+- name: Create persistent workspace logging directory for global tool reports
+  ansible.builtin.file:
+    path: /tmp/logs
+    state: directory
+    owner: root
+    group: root
+    mode: '0777'
+
+- name: Create Dedicated Docker DevOps Network
+  community.docker.docker_network:
+    name: devops-network
+    state: present
+
+- name: Download Jenkins apt GPG key
+  ansible.builtin.get_url:
+    url: https://pkg.jenkins.io/debian-stable/jenkins.io-2026.key
+    dest: /usr/share/keyrings/jenkins-keyring.asc
+    mode: '0644'
+    force: yes
+
+- name: Add Jenkins apt repository
+  ansible.builtin.apt_repository:
+    repo: "deb [signed-by=/usr/share/keyrings/jenkins-keyring.asc] https://pkg.jenkins.io/debian-stable binary/"
+    filename: jenkins
+    state: present
+
+- name: Update apt cache and install Jenkins
+  ansible.builtin.apt:
+    name:
+      - jenkins
+      - openjdk-21-jdk
+    state: present
+    update_cache: yes
+
+- name: Add jenkins user to the docker group
+  ansible.builtin.user:
+    name: jenkins
+    groups: docker
+    append: yes
+
+- name: Ensure correct permissions on docker.sock
+  ansible.builtin.file:
+    path: /var/run/docker.sock
+    mode: '0666'
+
+- name: Restart Jenkins service to apply group membership changes
+  ansible.builtin.service:
+    name: jenkins
+    state: restarted
+
+- name: Download Vault CLI zip archive directly
+  ansible.builtin.get_url:
+    url: "https://releases.hashicorp.com/vault/1.15.6/vault_1.15.6_linux_amd64.zip"
+    dest: "/tmp/vault.zip"
+    mode: '0644'
+
+- name: Unarchive Vault binary into execution path
+  ansible.builtin.unarchive:
+    src: "/tmp/vault.zip"
+    dest: "/usr/local/bin/"
+    remote_src: yes
+    mode: '0755'
+  args:
+    creates: /usr/local/bin/vault
+
+- name: Download the latest stable ArgoCD CLI binary
+  ansible.builtin.get_url:
+    url: https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+    dest: /usr/local/bin/argocd
+    mode: '0755'
+
+- name: SonarQube ElasticSearch requirements
+  sysctl:
+    name: vm.max_map_count
+    value: '262144'
+    state: present
+    reload: yes
+
+- name: Start SonarQube Container 
+  community.docker.docker_container:
+    name: sonarqube
+    image: sonarqube:community
+    state: started
+    restart_policy: always
+    ports:
+      - "{{ sonarqube_port }}:9000"
+    networks:
+      - name: devops-network
+
+- name: Download SonarScanner CLI zip
+  get_url:
+    url: "https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-{{ sonar_scanner_version }}-linux-x64.zip"
+    dest: "/tmp/sonar-scanner.zip"
+
+- name: Extract SonarScanner CLI
+  unarchive:
+    src: "/tmp/sonar-scanner.zip"
+    dest: "/opt/"
+    remote_src: yes
+  args:
+    creates: "/opt/sonar-scanner-{{ sonar_scanner_version }}-linux-x64"
+
+- name: Create Symlink for SonarScanner global executable
+  file:
+    src: "/opt/sonar-scanner-{{ sonar_scanner_version }}-linux-x64/bin/sonar-scanner"
+    dest: "/usr/local/bin/sonar-scanner"
+    state: link
+
+- name: Install kubectl CLI tool
+  shell: |
+    curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+    install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+  args:
+    creates: /usr/local/bin/kubectl
+
+- name: Install minikube binary
+  shell: |
+    curl -LO https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
+    install minikube-linux-amd64 /usr/local/bin/minikube
+  args:
+    creates: /usr/local/bin/minikube
+
+- name: Install Helm Operator CLI
+  shell: |
+    curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+    chmod +x get_helm.sh
+    ./get_helm.sh
+  args:
+    creates: /usr/local/bin/helm
+
+- name: Check Minikube runtime status
+  shell: minikube status
+  become: no
+  register: minikube_check
+  failed_when: false
+  changed_when: false
+
+- name: Start minikube
+  shell: |
+    minikube start \
+      --driver=docker \
+      --cpus=2 \
+      --memory=3584 \
+      --disk-size=20g \
+      --wait-timeout=15m
+  become: no
+  when: "'Running' not in minikube_check.stdout"
+
+- name: Wait until Minikube environment is ready
+  shell: minikube status --format '{% raw %}{{.Host}}{% endraw %}'
+  become: no
+  register: minikube_status
+  until: minikube_status.stdout == "Running"
+  retries: 15
+  delay: 15
+
+- name: Create .kube and profiles directory structure for Jenkins user
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: jenkins
+    group: jenkins
+    mode: '0755'
+  loop:
+    - /var/lib/jenkins/.kube
+    - /var/lib/jenkins/.kube/profiles/minikube
+
+- name: Copy primary kubeconfig file to Jenkins home directory
+  ansible.builtin.copy:
+    src: /home/ubuntu/.kube/config
+    dest: /var/lib/jenkins/.kube/config
+    remote_src: yes
+    owner: jenkins
+    group: jenkins
+    mode: '0600'
+
+- name: Copy cluster Certificate Authority (ca.crt) to Jenkins directory
+  ansible.builtin.copy:
+    src: /home/ubuntu/.minikube/ca.crt
+    dest: /var/lib/jenkins/.kube/ca.crt
+    remote_src: yes
+    owner: jenkins
+    group: jenkins
+    mode: '0644'
+
+- name: Copy minikube client certificates and keys to Jenkins profiles directory
+  ansible.builtin.copy:
+    src: "/home/ubuntu/.minikube/profiles/minikube/{{ item }}"
+    dest: "/var/lib/jenkins/.kube/profiles/minikube/{{ item }}"
+    remote_src: yes
+    owner: jenkins
+    group: jenkins
+    mode: '0600'
+  loop:
+    - client.crt
+    - client.key
+
+- name: Update file paths inside Jenkins kubeconfig to point to its own home directory
+  ansible.builtin.replace:
+    path: /var/lib/jenkins/.kube/config
+    regexp: '/home/ubuntu/\.minikube'
+    replace: '/var/lib/jenkins/.kube'
+
+- name: Finalize explicit ownership enforcement over all Jenkins .kube configurations
+  ansible.builtin.file:
+    path: /var/lib/jenkins/.kube
+    state: directory
+    recurse: yes
+    owner: jenkins
+    group: jenkins
+
+- name: Give Kubernetes internal API server a warm-up buffer
+  pause:
+    seconds: 20
+
+- name: Register External Helm repositories
+  shell: |
+    helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+    helm repo add grafana https://grafana.github.io/helm-charts
+    helm repo add hashicorp https://helm.releases.hashicorp.com
+    helm repo add external-secrets https://charts.external-secrets.io
+    helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+    helm repo update
+  become: no
+
+- name: Deploy Ingress Nginx Controller Engine
+  shell: |
+    helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
+      --namespace ingress-nginx \
+      --create-namespace \
+      --set controller.service.type=NodePort \
+      --set controller.watchIngressWithoutClass=true
+  become: no
+
+- name: Create monitoring namespace safely
+  shell: |
+    kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
+  become: no
+
+- name: Deploy Prometheus & Grafana Stack
+  shell: |
+    helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+      --namespace monitoring \
+      --set prometheus.prometheusSpec.podAntiAffinity="hard" \
+      --set grafana.enabled=true
+  become: no
+
+- name: Deploy HashiCorp Vault
+  shell: |
+    helm upgrade --install vault hashicorp/vault --namespace vault --create-namespace --set "server.dev.enabled=true" --set "server.dev.devRootToken=root-token"
+  become: no
+
+- name: Deploy External Secrets Operator (ESO)
+  shell: |
+    helm upgrade --install external-secrets external-secrets/external-secrets \
+      --namespace external-secrets \
+      --create-namespace \
+      --set installCRDs=true \
+      --set resources.requests.memory=128Mi \
+      --set resources.limits.memory=256Mi
+  become: no
+
+- name: Spin up ArgoCD GitOps Operator
+  shell: |
+    kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
+    kubectl apply -n argocd --server-side=true --force-conflicts -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+  become: no

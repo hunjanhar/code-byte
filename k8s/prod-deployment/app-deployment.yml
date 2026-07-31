@@ -1,0 +1,83 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: code-byte-deployment
+  namespace: code-byte-ns
+spec:
+  replicas: 1
+  revisionHistoryLimit: 2
+  selector:
+    matchLabels:
+      app: code-byte
+  template:
+    metadata:
+      labels:
+        app: code-byte
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: code-byte
+          image: hunjanhar/code-byte:latest
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          envFrom:
+          - secretRef:
+              name: mysql-env-secret
+          resources:
+            requests:
+              cpu: "100m"   
+              memory: "64Mi" 
+            limits:
+              memory: "128Mi"
+              cpu: "500m"
+          ports:
+          - containerPort: 80
+          volumeMounts:
+          - name: apache-config-volume
+            mountPath: /etc/apache2/conf-enabled/server-status.conf
+            subPath: server-status.conf
+          - name: tmp-volume
+            mountPath: /tmp
+          - name: apache-logs
+            mountPath: /var/log/apache2
+          - name: run-volume
+            mountPath: /var/run
+        
+        - name: apache-exporter
+          image: lusotycoon/apache-exporter:latest
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          args:
+            - "--scrape_uri=http://localhost/server-status?auto"
+          ports:
+            - containerPort: 9117
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "32Mi"
+            limits:
+              cpu: "100m"
+              memory: "64Mi"
+      
+      volumes:
+      - name: apache-config-volume
+        configMap:
+          name: apache-status-config
+      - name: tmp-volume
+        emptyDir: {}
+      - name: apache-logs
+        emptyDir: {}
+      - name: run-volume
+        emptyDir: {}

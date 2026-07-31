@@ -1,0 +1,23 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: code-byte-ns
+
+resources:
+  - redis-deployment.yml
+  - redis-service.yml
+  - app-deployment.yml
+  - app-svc.yml
+  - scaling-app.yml
+  - service-monitor.yml
+  - secret-store.yml
+  - external-secret.yml
+
+
+configMapGenerator:
+- name: mysql-init-script
+  files:
+    - codebyte.sql
+- name: apache-status-config
+  files:
+    - server-status.conf

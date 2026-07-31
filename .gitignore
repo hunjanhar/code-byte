@@ -1,0 +1,16 @@
+.env
+.env.jenkins
+.env.example
+.DS_Store
+k8s-deployment
+argo-deployment
+email-config
+.env.configure.jenkins
+scripts
+.secrets.sh
+.terraform
+terraform/code-byte-ec2
+terraform/code-byte-ec2.pub
+.terraform.lock.hcl
+terraform.tfstate
+terraform.tfstate.backup

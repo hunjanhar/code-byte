@@ -1,0 +1,274 @@
+pipeline {
+    agent any
+
+    parameters {
+        string(name: 'IMAGE_TAG', defaultValue: 'latest', description: 'Docker image tag passed from CI')
+        string(name: 'APP_ENV', defaultValue: 'prod', description: 'Target environment')
+    }
+    
+    environment {
+        GITHUB_URL       = 'https://github.com/hunjanhar/code-byte.git' 
+        BRANCH           = 'prod'
+        TARGET_NAMESPACE = 'code-byte-ns'
+        DOCKER_REGISTRY  = 'docker.io'
+        IMAGE_NAME       = 'hunjanhar/code-byte'
+        EMAIL_TO         = credentials('EMAIL')
+        IMAGE_TAG        = "${params.IMAGE_TAG}" 
+        APP_ENV          = "${params.APP_ENV}"
+        ZAP_TARGET       = credentials('server-url')
+    }
+
+    stages {
+        stage('Cleanup Workspace') {
+            steps {
+                echo 'Cleaning up previous workspace...'
+                cleanWs()
+            }
+        }
+
+        stage('Git Checkout Prod') {
+            steps {
+                library identifier: "local-shared-library@${env.BRANCH}", retriever: legacySCM(scm)
+                script {
+                    checkCode.checkoutCode(env.GITHUB_URL, env.BRANCH)
+                }
+            }
+        }
+
+        stage('Verify Image on Docker Hub') {
+            steps {
+                script {
+                    def checkRegistry = sh(
+                        script: "docker manifest inspect ${env.DOCKER_REGISTRY}/${env.IMAGE_NAME}:${env.IMAGE_TAG} > /dev/null 2>&1 && echo 'FOUND' || echo 'MISSING'", 
+                        returnStdout: true
+                    ).trim()
+                    if (checkRegistry == "MISSING") {
+                        error "Failure: Docker image [${env.DOCKER_REGISTRY}/${env.IMAGE_NAME}:${env.IMAGE_TAG}] was not found on Docker Hub!"
+                    } else {
+                        echo "Success: Docker image verified on Docker Hub!"
+                    }
+                }
+            }
+        }
+
+        stage('Update & Validate K8s Manifest') {
+            steps {
+                echo "Updating deployment.yaml with image tag: ${env.IMAGE_TAG}"
+                // FIXED: Wrapped the sed statement inside a proper sh string block
+                sh "sed -i 's|hunjanhar/code-byte:.*|hunjanhar/code-byte:${env.IMAGE_TAG}|g' k8s/prod-deployment/app-deployment.yml"
+                echo "Validating Kubernetes Manifest..."
+                sh "kubectl apply --dry-run=client -f k8s/prod-deployment/app-deployment.yml"
+            }
+        }
+
+        stage('Manage Vault & K8s Secrets') {
+            steps {
+                withCredentials([
+                    string(credentialsId: 'vault-root-token', variable: 'VAULT_TOKEN'),
+                    string(credentialsId: 'codebyte-db-host', variable: 'DB_HOST'),
+                    string(credentialsId: 'codebyte-db-name', variable: 'DB_NAME'),
+                    string(credentialsId: 'codebyte-db-user', variable: 'DB_USER'),
+                    string(credentialsId: 'codebyte-db-password', variable: 'DB_PASSWORD'),
+                    string(credentialsId: 'codebyte-redis-host', variable: 'REDIS_HOST'),
+                    string(credentialsId: 'codebyte-redis-port', variable: 'REDIS_PORT')
+                ]) {
+                    script {
+                        echo "Injecting dynamic credentials cleanly into Vault pod..."
+                        sh """
+                        kubectl exec -n vault vault-0 -- env VAULT_TOKEN='${VAULT_TOKEN}' vault kv put secret/production/code-byte \
+                        DB_HOST="${DB_HOST}" \
+                        DB_NAME="${DB_NAME}" \
+                        DB_USER="${DB_USER}" \
+                        DB_PASSWORD="${DB_PASSWORD}" \
+                        REDIS_HOST="${REDIS_HOST}" \
+                        REDIS_PORT="${REDIS_PORT}"
+                        """
+                        
+                        sh """
+                            mkdir -p /tmp/logs
+                            mysql -v -h "${DB_HOST}" -u "${DB_USER}" -p"${DB_PASSWORD}" "${DB_NAME}" < k8s/prod-deployment/codebyte.sql | tee /tmp/logs/migration-output.log
+                        """
+
+                        sh """
+                            kubectl create namespace ${env.TARGET_NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
+                            kubectl delete secret vault-token -n ${env.TARGET_NAMESPACE} --ignore-not-found=true
+                            kubectl create secret generic vault-token \
+                                -n ${env.TARGET_NAMESPACE} \
+                                --from-literal=token='${VAULT_TOKEN}'
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Validate Environment') {
+            steps {
+                script {
+                    if (!params.IMAGE_TAG) {
+                        error "Pipeline halted: IMAGE_TAG parameter is completely empty."
+                    }
+                    echo "Deploying image tag: ${params.IMAGE_TAG} to ${params.APP_ENV}"
+                }
+            }
+        }
+
+        stage('Update Manifest & Git Push to Prod') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'github-token', 
+                                                usernameVariable: 'GIT_USER', 
+                                                passwordVariable: 'GIT_TOKEN')]) {
+                        script {
+                            sh """
+                                if git status --porcelain | grep -q 'M k8s/prod-deployment/app-deployment.yml'; then
+                                    echo "Changes detected. Committing updated manifest..."
+                                    git add k8s/prod-deployment/app-deployment.yml
+                                    git commit -m "update deployment image tag to ${env.IMAGE_TAG}"
+                                else
+                                    echo "Manifest matches remote tracking. Nothing to commit."
+                                fi
+                                git pull origin prod --rebase
+                                git push https://${GIT_USER}:${GIT_TOKEN}@github.com/hunjanhar/code-byte.git HEAD:prod
+                            """
+                    }
+                }
+            }
+        }
+
+        stage('Apply ArgoCD Manifests') {
+            steps {
+                script {
+                    def appExists = sh(
+                        script: "kubectl get application code-byte-argocd -n argocd --no-headers -o name || true",
+                        returnStdout: true
+                    ).trim()
+                    if (appExists != "") {
+                        echo "Skipping: ArgoCD application is already running. No changes applied."
+                    } else {
+                        echo "Applying ArgoCD application configurations..."
+                        sh "kubectl apply -f argocd-config/"
+                    }
+                }
+            }
+        }
+
+        stage('Sync & Check ArgoCD Status') {
+            steps {
+                script {
+                    echo "Triggering ArgoCD Sync via kubectl..."
+
+                    sh '''
+                        kubectl annotate application code-byte-argocd -n argocd \
+                            argocd.argoproj.io/refresh=normal --overwrite
+
+                        kubectl wait --for=jsonpath='{.status.operationState.phase}'=Succeeded \
+                            application/code-byte-argocd -n argocd --timeout=120s
+
+                        kubectl wait --for=jsonpath='{.status.health.status}'=Healthy \
+                            application/code-byte-argocd -n argocd --timeout=120s
+                    '''
+                }
+            }
+        }
+
+        stage('Port Forwards') {
+            steps {
+                script {
+                    sh '''
+                        export JENKINS_NODE_COOKIE=dontKillMe
+                        export BUILD_ID=dontKillMe
+
+                        pkill -f "kubectl port-forward" || true
+                        mkdir -p /tmp/logs
+
+                        BUILD_ID=dontKillMe nohup kubectl port-forward svc/argocd-server 8085:443 -n argocd --address=0.0.0.0 > /tmp/logs/argocd.log 2>&1 &
+                        BUILD_ID=dontKillMe nohup kubectl port-forward svc/kube-prometheus-stack-grafana 3000:80 -n monitoring --address=0.0.0.0 > /tmp/logs/grafana.log 2>&1 &
+                        BUILD_ID=dontKillMe nohup kubectl port-forward svc/kube-prometheus-stack-prometheus 9090:9090 -n monitoring --address=0.0.0.0 > /tmp/logs/prometheus.log 2>&1 &
+
+                        kubectl rollout status deployment/code-byte-deployment -n code-byte-ns --timeout=60s
+
+                        BUILD_ID=dontKillMe nohup kubectl port-forward deployment/code-byte-deployment 5000:80 -n code-byte-ns --address=0.0.0.0 > /tmp/logs/app.log 2>&1 &
+                        
+                        sleep 5
+                        pgrep -fl "kubectl port-forward" || echo "ERROR: No port-forward processes running!"
+                    '''
+                }
+            }
+        }
+
+        stage('OWASP ZAP DAST Scan') {
+            steps {
+                script {
+                    dastScan.dastsecurityscan(env.ZAP_TARGET)
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            cleanWs()
+            echo 'Pipeline execution finished.'
+        }
+        success {
+            mail to: "${env.EMAIL_TO}",
+                mimeType: 'text/html',
+                subject: "✅ SUCCESS: Pipeline Build #${env.BUILD_NUMBER} Deployed",
+                body: """
+                <!DOCTYPE html>
+                <html>
+                <body style="font-family: Arial, sans-serif; background-color: #f4f5f7; padding: 20px;">
+                    <div style="max-width: 600px; margin: 0 auto; background: #ffffff; border-radius: 8px; border: 1px solid #e1e4e8; overflow: hidden;">
+                        
+                        <div style="background-color: #28a745; color: #ffffff; padding: 20px; text-align: center;">
+                            <h2 style="margin: 0;">🚀 Deployment Successful!</h2>
+                        </div>
+                        
+                        <div style="padding: 24px;">
+                            <p style="font-size: 15px;">Build <b>#${env.BUILD_NUMBER}</b> was successfully pushed, secrets synced via Vault, and synchronized in ArgoCD.</p>
+                            
+                            <table style="width: 100%; margin: 15px 0; border-collapse: collapse;">
+                                <tr><td><b>Job Name:</b></td><td>${env.JOB_NAME}</td></tr>
+                                <tr><td><b>Image Tag:</b></td><td><code>${env.IMAGE_TAG ?: 'latest'}</code></td></tr>
+                            </table>
+                            
+                            <div style="margin-top: 25px; text-align: center; background: #f8f9fa; padding: 15px; border-radius: 6px;">
+                                <p style="margin-top:0; font-weight:bold; color: #555;">Quick Actions</p>
+                                <a href="${env.BUILD_URL}" style="background-color: #0066cc; color: #ffffff; padding: 10px 16px; text-decoration: none; border-radius: 4px; font-weight: bold; margin: 4px; display: inline-block;">🔍 Jenkins Build</a>
+                                <a href="${env.ZAP_TARGET}" style="background-color: #36506a; color: #ffffff; padding: 10px 16px; text-decoration: none; border-radius: 4px; font-weight: bold; margin: 4px; display: inline-block;">👾 Application</a>
+                            </div>
+                        </div>
+                    </div>
+                </body>
+                </html>
+                """
+        }
+        failure {
+            mail to: "${env.EMAIL_TO}",
+                mimeType: 'text/html',
+                subject: "🚨 FAILURE: Pipeline Build #${env.BUILD_NUMBER} Failed",
+                body: """
+                <!DOCTYPE html>
+                <html>
+                <body style="font-family: Arial, sans-serif; background-color: #f4f5f7; padding: 20px;">
+                    <div style="max-width: 600px; margin: 0 auto; background: #ffffff; border-radius: 8px; border: 1px solid #e1e4e8; overflow: hidden;">
+                        
+                        <div style="background-color: #d9534f; color: #ffffff; padding: 20px; text-align: center;">
+                            <h2 style="margin: 0;">💥 Pipeline Failed</h2>
+                        </div>
+                        
+                        <div style="padding: 24px;">
+                            <p style="font-size: 15px;">Build <b>#${env.BUILD_NUMBER}</b> encountered an error during deployment.</p>
+                            
+                            <div style="margin-top: 25px; text-align: center; background: #fff0f0; padding: 15px; border-radius: 6px; border: 1px solid #f5c6cb;">
+                                <p style="margin-top:0; font-weight:bold; color: #721c24;">Investigate & Fix</p>
+                                <a href="${env.BUILD_URL}console" style="background-color: #d9534f; color: #ffffff; padding: 10px 16px; text-decoration: none; border-radius: 4px; font-weight: bold; margin: 4px; display: inline-block;">📜 View Console Logs</a>
+                                <a href="${env.BUILD_URL}rebuild" style="background-color: #6c757d; color: #ffffff; padding: 10px 16px; text-decoration: none; border-radius: 4px; font-weight: bold; margin: 4px; display: inline-block;">🔄 Re-trigger Build</a>
+                            </div>
+                        </div>
+                    </div>
+                </body>
+                </html>
+                """
+        }
+    }
+}

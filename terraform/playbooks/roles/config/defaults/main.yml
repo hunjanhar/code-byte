@@ -1,0 +1,7 @@
+#SPDX-License-Identifier: MIT-0
+---
+# defaults file for config
+ansible_user: ansible_user
+jenkins_port: "8080"
+sonarqube_port: "9000"
+sonar_scanner_version: "6.2.1.4610"

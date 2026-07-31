@@ -1,0 +1,207 @@
+pipeline {
+    agent any
+
+    parameters {
+        string(name: 'BRANCH', defaultValue: 'main', description: 'Git branch to build')
+    }
+
+    environment {
+        DOCKER_REGISTRY = 'docker.io'
+        IMAGE_NAME      = 'hunjanhar/code-byte'
+        CD_JOB_NAME     = 'code-byte-cd'
+        GITHUB_URL      = 'https://github.com/hunjanhar/code-byte.git'
+        EMAIL_TO           = credentials('EMAIL')
+        SONAR_URL       = credentials('SONAR_SERVER_URL')
+    }
+
+    stages {
+        stage('Validate & Cleanup') {
+            steps {
+                cleanWs()
+                echo "Workspace prepared for native PHP application build."
+            }
+        }
+        
+        stage('Fetch Source Code') {
+            steps {
+                script {
+                    library identifier: "local-shared-library@${params.BRANCH}", retriever: legacySCM(scm)
+                    checkCode.checkoutCode(env.GITHUB_URL, params.BRANCH)
+                }
+            }
+        }
+
+        stage('Run Test Case') {
+            steps {
+                sh "php -l index.php"
+            }
+        }
+        
+        stage('Security Scans') {
+            steps {
+                script {
+                    securityScanners.runGitleaks()
+                    securityScanners.runTrivyFileSystem()
+                }
+            }
+        }
+        
+        stage('SonarQube Code Analysis') {
+            steps {
+                withCredentials([string(credentialsId: 'sonar-token-id', variable: 'SONAR_TOKEN')]) {
+                    sh """
+                        sonar-scanner \
+                            -Dsonar.host.url="${env.SONAR_URL}" \
+                            -Dsonar.token="\$SONAR_TOKEN" \
+                            -Dsonar.projectKey="codebyte-php-app" \
+                            -Dsonar.sources=. \
+                            -Dsonar.exclusions="k8s/**,static/**,**.sql"
+                    """
+                }   
+            }
+        }
+        
+        stage('Export Docker Tag') {
+            steps {
+                script {
+                    def shortCommit = sh(returnStdout: true, script: "git rev-parse --short HEAD").trim()
+                    env.IMAGE_TAG = "${BUILD_NUMBER}-${shortCommit}"
+                    env.APP_ENV = (env.BRANCH_NAME == 'main') ? 'production' : 'staging'
+                }
+            }
+        }
+
+        stage('Docker Build & Scan') {
+            steps {
+                sh "docker build -t ${DOCKER_REGISTRY}/${IMAGE_NAME}:${env.IMAGE_TAG} ."
+                script {
+                    securityScanners.runTrivyImageScan(env.DOCKER_REGISTRY, env.IMAGE_NAME, env.IMAGE_TAG)
+                }
+            }
+        }
+        
+        stage('Push to Registry') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'docker-registry-credentials-id', passwordVariable: 'REG_PASSWORD', usernameVariable: 'REG_USERNAME')]) {
+                    sh 'echo "$REG_PASSWORD" | docker login ' + env.DOCKER_REGISTRY + ' -u "$REG_USERNAME" --password-stdin'
+                    sh "docker push ${DOCKER_REGISTRY}/${IMAGE_NAME}:${env.IMAGE_TAG}"
+                    sh "docker tag ${DOCKER_REGISTRY}/${IMAGE_NAME}:${env.IMAGE_TAG} ${DOCKER_REGISTRY}/${IMAGE_NAME}:latest"
+                    sh "docker push ${DOCKER_REGISTRY}/${IMAGE_NAME}:latest"
+                    sh "docker logout ${DOCKER_REGISTRY}"
+                }
+            }
+        }
+        
+        stage('Trigger CD Pipeline') {
+            steps {
+                echo "Trigger CD Pipeline"
+                build job: "${env.CD_JOB_NAME}", parameters: [
+                    string(name: 'IMAGE_TAG', value: env.IMAGE_TAG),
+                    string(name: 'APP_ENV', value: env.APP_ENV)
+                ], wait: false
+            }
+        }
+    }
+
+    post {
+        always {
+            cleanWs()
+        }
+        success {
+            echo "CI Pipeline executed successfully!"
+            mail to: "${env.EMAIL_TO}",
+                mimeType: 'text/html',
+                subject: "✅ SUCCESS: Jenkins Build #${env.BUILD_NUMBER} [${env.JOB_NAME}]",
+                body: """
+                <!DOCTYPE html>
+                <html>
+                <body style="font-family: Arial, sans-serif; color: #333333; background-color: #f4f5f7; padding: 20px;">
+                    <div style="max-width: 600px; margin: 0 auto; background: #ffffff; border-radius: 8px; border: 1px solid #e1e4e8; overflow: hidden;">
+                        
+                        <div style="background-color: #28a745; color: #ffffff; padding: 20px; text-align: center;">
+                            <h2 style="margin: 0;">🎉 Build Succeeded!</h2>
+                        </div>
+                        
+                        <div style="padding: 24px;">
+                            <p style="font-size: 16px;">Great news! The pipeline completed all stages successfully.</p>
+                            
+                            <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
+                                <tr>
+                                    <td style="padding: 8px 0; font-weight: bold; width: 35%;">Project:</td>
+                                    <td style="padding: 8px 0;">${env.JOB_NAME}</td>
+                                </tr>
+                                <tr>
+                                    <td style="padding: 8px 0; font-weight: bold;">Build Number:</td>
+                                    <td style="padding: 8px 0;">#${env.BUILD_NUMBER}</td>
+                                </tr>
+                                <tr>
+                                    <td style="padding: 8px 0; font-weight: bold;">Docker Image Tag:</td>
+                                    <td style="padding: 8px 0;"><code style="background: #eef2f5; padding: 2px 6px; border-radius: 4px;">${env.IMAGE_TAG}</code></td>
+                                </tr>
+                                <tr>
+                                    <td style="padding: 8px 0; font-weight: bold;">Build Duration:</td>
+                                    <td style="padding: 8px 0;">${currentBuild.durationString.replace(' and counting', '')}</td>
+                                </tr>
+                            </table>
+                            
+                            <div style="text-align: center; margin-top: 30px;">
+                                <a href="${env.BUILD_URL}" style="background-color: #0066cc; color: #ffffff; padding: 12px 24px; text-decoration: none; border-radius: 5px; font-weight: bold; display: inline-block;">View Build Details</a>
+                            </div>
+                        </div>
+                        
+                        <div style="background-color: #f8f9fa; padding: 12px; text-align: center; font-size: 12px; color: #6c757d; border-top: 1px solid #e1e4e8;">
+                            Automated notification sent by Jenkins CI Engine
+                        </div>
+                    </div>
+                </body>
+                </html>
+                """
+        }
+        failure {
+            echo "CI Pipeline failed."
+            mail to: "${env.EMAIL_TO}",
+                mimeType: 'text/html',
+                subject: "🚨 FAILED: Jenkins Build #${env.BUILD_NUMBER} [${env.JOB_NAME}]",
+                body: """
+                <!DOCTYPE html>
+                <html>
+                <body style="font-family: Arial, sans-serif; color: #333333; background-color: #f4f5f7; padding: 20px;">
+                    <div style="max-width: 600px; margin: 0 auto; background: #ffffff; border-radius: 8px; border: 1px solid #e1e4e8; overflow: hidden;">
+                        
+                        <div style="background-color: #d9534f; color: #ffffff; padding: 20px; text-align: center;">
+                            <h2 style="margin: 0;">💥 Build Failed</h2>
+                        </div>
+                        
+                        <div style="padding: 24px;">
+                            <p style="font-size: 16px;">Attention! The pipeline execution encountered an error and requires review.</p>
+                            
+                            <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
+                                <tr>
+                                    <td style="padding: 8px 0; font-weight: bold; width: 35%;">Project:</td>
+                                    <td style="padding: 8px 0;">${env.JOB_NAME}</td>
+                                </tr>
+                                <tr>
+                                    <td style="padding: 8px 0; font-weight: bold;">Build Number:</td>
+                                    <td style="padding: 8px 0;">#${env.BUILD_NUMBER}</td>
+                                </tr>
+                                <tr>
+                                    <td style="padding: 8px 0; font-weight: bold;">Attempted Image:</td>
+                                    <td style="padding: 8px 0;"><code style="background: #eef2f5; padding: 2px 6px; border-radius: 4px;">${env.IMAGE_TAG ?: 'N/A'}</code></td>
+                                </tr>
+                            </table>
+                            
+                            <div style="text-align: center; margin-top: 30px;">
+                                <a href="${env.BUILD_URL}console" style="background-color: #d9534f; color: #ffffff; padding: 12px 24px; text-decoration: none; border-radius: 5px; font-weight: bold; display: inline-block;">Inspect Console Logs</a>
+                            </div>
+                        </div>
+                        
+                        <div style="background-color: #f8f9fa; padding: 12px; text-align: center; font-size: 12px; color: #6c757d; border-top: 1px solid #e1e4e8;">
+                            Automated notification sent by Jenkins CI Engine
+                        </div>
+                    </div>
+                </body>
+                </html>
+                """
+        }
+    }
+}

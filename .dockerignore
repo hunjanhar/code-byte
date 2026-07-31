@@ -1,0 +1,17 @@
+k8s
+.dockerignore
+.env
+env.configure.jenkins
+codebyte.sql
+docker-compose.yml
+Dockerfile
+.jenkins
+vars
+argocd-config
+.git
+.gitignore
+scripts
+remote-infa
+terraform
+vars
+assets
